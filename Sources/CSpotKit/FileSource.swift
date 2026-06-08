@@ -178,7 +178,7 @@ func runMdfind(_ args: [String], timeoutMs: Int, maxLines: Int) -> [String] {
     p.arguments = args
     let out = Pipe()
     p.standardOutput = out
-    p.standardError = Pipe()
+    p.standardError = FileHandle.nullDevice   // unused — discard so it can't fill/block
 
     do { try p.run() } catch { return [] }
 

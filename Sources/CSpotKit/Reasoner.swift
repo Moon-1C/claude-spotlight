@@ -175,7 +175,7 @@ public struct ClaudeCLIReasoner: Reasoner {
             let inPipe = Pipe(), outPipe = Pipe()
             proc.standardInput = inPipe
             proc.standardOutput = outPipe
-            proc.standardError = Pipe()
+            proc.standardError = FileHandle.nullDevice   // unused — avoid an undrained pipe deadlock
 
             signal(SIGPIPE, SIG_IGN)   // claude may close stdin early; don't let the write crash us
             do { try proc.run() } catch { return nil }

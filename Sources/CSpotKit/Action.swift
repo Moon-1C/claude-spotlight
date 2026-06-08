@@ -21,19 +21,23 @@ public struct Action: Codable, Sendable {
         self.destructive = destructive
     }
 
-    /// Reads/opens/drafts run automatically (with a toast); record-creating & sending kinds confirm.
+    /// Kinds that mutate state / send. Opens & drafts (composeMail/replyMail open a draft, never send)
+    /// run automatically with a toast.
+    static let mutatingKinds: Set<ActionKind> = [
+        .createNote, .appendNote, .addCalendarEvent, .addReminder, .sendMessage, .runShortcut,
+    ]
+
+    /// Records, sends, OR anything the model flagged destructive must be confirmed.
     public var requiresConfirm: Bool {
-        switch kind {
-        case .openURL, .revealFile, .copyText, .composeMail, .replyMail: return false
-        case .createNote, .appendNote, .addCalendarEvent, .addReminder, .sendMessage, .runShortcut: return true
-        }
+        destructive || Action.mutatingKinds.contains(kind)
     }
 
     /// Build from the decoded `structured_output.action` object (JSON via JSONSerialization).
     public static func from(_ dict: [String: Any]) -> Action? {
         guard let kindStr = dict["kind"] as? String, let kind = ActionKind(rawValue: kindStr) else { return nil }
+        // params values are strings per the schema; keep only genuine strings (drop nulls/numbers/arrays).
         let params: [String: String] = (dict["params"] as? [String: Any])?
-            .reduce(into: [:]) { $0[$1.key] = "\($1.value)" } ?? [:]
+            .compactMapValues { $0 as? String } ?? [:]
         let preview = (dict["preview"] as? String) ?? kind.rawValue
         let destructive = (dict["destructive"] as? Bool) ?? false
         return Action(kind: kind, params: params, preview: preview, destructive: destructive)

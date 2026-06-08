@@ -57,7 +57,8 @@ public struct ActionExecutor: Sendable {
         let r = EKReminder(eventStore: store)
         r.title = p["title"] ?? "Reminder"
         r.calendar = store.defaultCalendarForNewReminders()
-        if let due = p["due"], let d = Self.iso.date(from: due) {
+        if let due = p["due"], !due.isEmpty {
+            guard let d = Self.parseDate(due) else { return .failure("couldn't parse due date: \(due)") }
             r.dueDateComponents = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: d)
             r.addAlarm(EKAlarm(absoluteDate: d))
         }
@@ -74,10 +75,10 @@ public struct ActionExecutor: Sendable {
             if !ok { return .failure("Calendar access not granted") }
         default: return .failure("Calendar access denied — System Settings ▸ Privacy ▸ Calendars")
         }
-        guard let title = p["title"], let startS = p["start"], let start = Self.iso.date(from: startS) else {
+        guard let title = p["title"], let startS = p["start"], let start = Self.parseDate(startS) else {
             return .failure("need title + start")
         }
-        let end = p["end"].flatMap(Self.iso.date(from:)) ?? start.addingTimeInterval(3600)
+        let end = p["end"].flatMap(Self.parseDate) ?? start.addingTimeInterval(3600)
         let ev = EKEvent(eventStore: store)
         ev.title = title; ev.startDate = start; ev.endDate = end
         ev.location = p["location"]; ev.notes = p["notes"]
@@ -97,8 +98,18 @@ public struct ActionExecutor: Sendable {
     private func appendNote(_ p: [String: String]) -> Outcome {
         let title = esc(p["title"] ?? "")
         let body = esc(htmlBody(p["body"] ?? ""))
-        let script = "tell application \"Notes\"\nset n to first note whose name is \"\(title)\"\nset body of n to (body of n) & \"<br>\(body)\"\nend tell"
-        return run(script, ok: "Appended to note: \(p["title"] ?? "")")
+        // Create the note if none with that name exists (the model picked the title), else append.
+        let script = """
+        tell application "Notes"
+        if (count of (notes whose name is "\(title)")) is 0 then
+        make new note at folder "Notes" with properties {name:"\(title)", body:"<div>\(body)</div>"}
+        else
+        set n to first note whose name is "\(title)"
+        set body of n to (body of n) & "<br>\(body)"
+        end if
+        end tell
+        """
+        return run(script, ok: "Saved to note: \(p["title"] ?? "")")
     }
     private func composeMail(_ p: [String: String]) -> Outcome {
         let subj = esc(p["subject"] ?? "")
@@ -121,13 +132,33 @@ public struct ActionExecutor: Sendable {
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/shortcuts")
         proc.arguments = ["run", name]
         if let input = p["input"] { proc.arguments?.append(contentsOf: ["-i", input]) }
-        do { try proc.run(); proc.waitUntilExit() } catch { return .failure("\(error)") }
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return .failure("\(error)") }
+        let watchdog = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: watchdog)
+        proc.waitUntilExit()
+        watchdog.cancel()
         return proc.terminationStatus == 0 ? .ok("Ran shortcut: \(name)") : .failure("shortcut exit \(proc.terminationStatus)")
     }
 
     // MARK: helpers
 
-    static let iso = ISO8601DateFormatter()
+    static let isoFormatter = ISO8601DateFormatter()
+
+    /// Lenient: accepts ISO-8601 with zone (Z/offset) AND the zone-less local forms the model emits.
+    static func parseDate(_ s: String) -> Date? {
+        if let d = isoFormatter.date(from: s) { return d }
+        for fmt in ["yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd HH:mm:ss",
+                    "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd HH:mm", "yyyy-MM-dd"] {
+            let df = DateFormatter()
+            df.locale = Locale(identifier: "en_US_POSIX")
+            df.timeZone = .current
+            df.dateFormat = fmt
+            if let d = df.date(from: s) { return d }
+        }
+        return nil
+    }
 
     private func esc(_ s: String) -> String {
         s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -145,12 +176,15 @@ public struct ActionExecutor: Sendable {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", script]
         let errPipe = Pipe()
-        p.standardOutput = Pipe()
+        p.standardOutput = FileHandle.nullDevice   // unused — discard so a large echo can't deadlock
         p.standardError = errPipe
         do { try p.run() } catch { return .failure("spawn: \(error)") }
+        let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: watchdog)
         let e = String(decoding: errPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         p.waitUntilExit()
+        watchdog.cancel()
         if p.terminationStatus != 0 || !e.isEmpty {
             if e.contains("-1743") { return .failure("Automation not allowed — grant it in System Settings ▸ Privacy ▸ Automation") }
             return .failure(e.isEmpty ? "osascript exit \(p.terminationStatus)" : e)

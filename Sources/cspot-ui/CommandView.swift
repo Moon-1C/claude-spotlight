@@ -12,6 +12,7 @@ final class SearchViewModel: ObservableObject {
     @Published var answer: String?
     @Published var toast: String?
     @Published var pendingAction: Action?   // a proposed mutating action awaiting ⏎ confirm
+    private var pendingActionQuery: String? // the query the proposal was made for (staleness guard)
     @Published var context: AppContext?   // the running app the user was in when they opened the launcher
     @Published var axTrusted: Bool = AXReader.isTrusted
     private var contextPID: pid_t?
@@ -49,6 +50,7 @@ final class SearchViewModel: ObservableObject {
     func onQueryChange() {
         task?.cancel()
         answer = nil          // stale once the query changes
+        pendingAction = nil   // a proposed action must never outlive the query it was made for
         let q = query
         guard !q.trimmingCharacters(in: .whitespaces).isEmpty else {
             results = []; selection = 0; return
@@ -92,7 +94,8 @@ final class SearchViewModel: ObservableObject {
             // Deep-read the captured app's content/selection now, targeting the app the user was in.
             var ctx = await ContextCapture.capture(appName: lightCtx?.app, deep: true) ?? lightCtx
             // Merge Accessibility-read selection/value when trusted (works across arbitrary apps).
-            if AXReader.isTrusted, let pid = await MainActor.run(body: { self?.contextPID }) ?? nil,
+            // weak self → self?.contextPID is pid_t??; flatten with `?? nil` before unwrapping.
+            if AXReader.isTrusted, let pid = (await MainActor.run { self?.contextPID }) ?? nil,
                let ax = AXReader.snapshot(pid: pid) {
                 if let sel = ax.selectedText, !sel.isEmpty { ctx?.selectionText = sel }
                 if (ctx?.bodyText?.isEmpty ?? true), let val = ax.focusedValue { ctx?.bodyText = val }
@@ -105,6 +108,7 @@ final class SearchViewModel: ObservableObject {
                     await MainActor.run {
                         guard let self, self.query == q else { return }
                         self.pendingAction = action          // show confirm band
+                        self.pendingActionQuery = q
                         self.isAsking = false
                     }
                 } else {
@@ -135,7 +139,8 @@ final class SearchViewModel: ObservableObject {
 
     /// The ONLY place a mutating action runs (confirmed:true). Wired to ⏎ on the confirm band.
     func confirmAction() {
-        guard let a = pendingAction else { return }
+        // Never confirm a proposal made for a query the user has since edited.
+        guard let a = pendingAction, query == pendingActionQuery else { pendingAction = nil; return }
         pendingAction = nil
         isAsking = true
         Task { [weak self] in

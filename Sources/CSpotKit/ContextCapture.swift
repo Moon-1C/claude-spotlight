@@ -169,7 +169,8 @@ public enum ContextCapture {
     }
 
     /// osascript runner that also surfaces stderr (needed to detect the browser JS-flag-OFF state).
-    static func runOSA2(_ script: String) -> (out: String?, err: String?) {
+    /// Drains stdout+stderr concurrently (no pipe-buffer deadlock) and bounds runtime with a watchdog.
+    static func runOSA2(_ script: String, timeoutMs: Int = 3000) -> (out: String?, err: String?) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", script]
@@ -177,11 +178,30 @@ public enum ContextCapture {
         p.standardOutput = o
         p.standardError = e
         do { try p.run() } catch { return (nil, "spawn") }
+
+        let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: watchdog)
+
+        let errBox = DataBox()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async {
+            errBox.data = e.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
         let od = o.fileHandleForReading.readDataToEndOfFile()
-        let ed = e.fileHandleForReading.readDataToEndOfFile()
+        group.wait()
         p.waitUntilExit()
+        watchdog.cancel()
+
         let out = String(decoding: od, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        let err = String(decoding: ed, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        let err = String(decoding: errBox.data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         return (out.isEmpty ? nil : out, err.isEmpty ? nil : err)
     }
+}
+
+/// Tiny reference box so the concurrent stderr drain can hand data back without a captured-var race.
+final class DataBox: @unchecked Sendable { var data = Data() }
+
+extension ContextCapture {
 }

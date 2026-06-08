@@ -27,7 +27,8 @@ class Cspot < Formula
   # url "https://github.com/Moon-1C/claude-spotlight/archive/refs/tags/v0.1.0.tar.gz"
   # sha256 "REPLACE_WITH_TARBALL_SHA256"
 
-  depends_on xcode: :build # Swift toolchain (Xcode Command Line Tools also work locally)
+  # Builds with the Swift toolchain from Xcode Command Line Tools — full Xcode not required,
+  # so we intentionally do NOT `depends_on xcode`. (`swift build` uses /usr/bin/swift.)
   depends_on :macos
 
   def install

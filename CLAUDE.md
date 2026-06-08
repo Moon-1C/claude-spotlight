@@ -37,8 +37,8 @@ summon with a global hotkey and use to talk to Claude. It is a native
 | Stage 1 (collect)  | Native, no LLM: `mdfind`/Spotlight + EventKit, parallel |
 | Stage 2 (reason)   | **Local `claude -p` headless** (default); optional `x-api-key` for distribution |
 | Sandbox            | **OFF** (data access needs it — reverses doc `07`); Hardened Runtime ON |
-| Build              | SwiftPM now (CLI engine); Xcode project for the `.app` (Phase 2) |
-| Status             | **Phase 0 done** — Stage-1 collector CLI (`swift run cspot "<q>"`) builds & verified |
+| Build              | SwiftPM; **no Xcode needed** — `.app` is hand-rolled + ad-hoc signed via `scripts/make-app.sh` |
+| Status             | **Read+act on running apps working.** Menu-bar `.app`, ⌥Space panel, file/app search, Stage-2 (`claude -p`) rank/answer/**action-proposal**, AppleScript context (browser/Mail/Notes/Finder), AXReader (Accessibility), write-actions w/ confirm |
 
 ## Where to look
 

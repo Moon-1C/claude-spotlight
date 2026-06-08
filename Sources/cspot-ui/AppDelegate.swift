@@ -1,4 +1,5 @@
 import AppKit
+import CSpotKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
@@ -42,7 +43,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func runSnapshots(into dir: String, query: String, ask: Bool) {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        panel.snapshotPrepare(query: query)   // render without stealing key focus
+        var demoCtx = AppContext(app: "Google Chrome")
+        demoCtx.url = "https://www.anthropic.com/news/claude-opus-4-8"
+        demoCtx.urlTitle = "Introducing Claude Opus 4.8"
+        panel.snapshotPrepare(query: query, demoContext: demoCtx)   // render without stealing key focus
         // Let the live search populate first.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self else { return }

@@ -4,11 +4,19 @@ import Foundation
 public struct ReasonResult: Sendable {
     public let orderedIDs: [String]   // Candidate.id values, best-first (a reorder/subset of the input)
     public let answer: String?        // one-line natural-language summary
+    public let action: Action?        // a proposed action when the user gave a command (mode=="action")
+
+    public init(orderedIDs: [String], answer: String?, action: Action? = nil) {
+        self.orderedIDs = orderedIDs
+        self.answer = answer
+        self.action = action
+    }
 }
 
-/// Stage 2: rank/synthesize Stage-1 candidates against a natural-language query using an LLM.
+/// Stage 2: rank/synthesize Stage-1 candidates against a natural-language query using an LLM,
+/// optionally aware of the running-app context the user is currently looking at.
 public protocol Reasoner: Sendable {
-    func rank(query: ParsedQuery, candidates: [Candidate]) async -> ReasonResult?
+    func rank(query: ParsedQuery, candidates: [Candidate], context: AppContext?) async -> ReasonResult?
 }
 
 /// Reasoner backed by the user's local, logged-in Claude Code CLI run headless (`claude -p`).
@@ -23,11 +31,12 @@ public struct ClaudeCLIReasoner: Reasoner {
     }
 
     // Structured-output schema (must be INLINE JSON for `--json-schema`; verified on this Mac).
+    // Stage 2 returns either a search ranking OR a proposed action.
     private static let schema =
-        #"{"type":"object","additionalProperties":false,"properties":{"ranked":{"type":"array","items":{"type":"string"}},"answer":{"type":"string"}},"required":["ranked","answer"]}"#
+        #"{"type":"object","additionalProperties":false,"properties":{"mode":{"type":"string","enum":["search","action"]},"ranked":{"type":"array","items":{"type":"string"}},"answer":{"type":"string"},"action":{"type":"object","additionalProperties":false,"properties":{"kind":{"type":"string","enum":["createNote","appendNote","addCalendarEvent","addReminder","composeMail","replyMail","sendMessage","openURL","revealFile","copyText","runShortcut"]},"params":{"type":"object","additionalProperties":{"type":"string"}},"preview":{"type":"string"},"destructive":{"type":"boolean"}},"required":["kind","params","preview","destructive"]}},"required":["mode","ranked","answer"]}"#
 
-    public func rank(query: ParsedQuery, candidates: [Candidate]) async -> ReasonResult? {
-        guard !candidates.isEmpty else { return nil }
+    public func rank(query: ParsedQuery, candidates: [Candidate], context: AppContext? = nil) async -> ReasonResult? {
+        guard !query.raw.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
 
         // Compact projection with short stable handles (c0..cn) to save tokens; map back afterward.
         var handleToID: [String: String] = [:]
@@ -49,13 +58,50 @@ public struct ClaudeCLIReasoner: Reasoner {
             let projStr = String(data: projData, encoding: .utf8)
         else { return nil }
 
-        let prompt = """
-        You are the ranking engine for a macOS search launcher. Rank the candidate items by how well \
-        they match the user's natural-language query by MEANING (not just keyword overlap). Return \
-        best-first in "ranked" using each item's "id". Include only plausibly relevant items and drop \
-        clearly irrelevant ones; if nothing matches well, return an empty "ranked". Give a concise \
-        one-sentence "answer" describing what you found (or that nothing matched). Do not use any tools.
+        var contextBlock = ""
+        if let context {
+            var lines = ["The user is currently using the app: \(context.app)"]
+            if let t = context.urlTitle ?? context.windowTitle, !t.isEmpty { lines.append("Window/page: \(t)") }
+            if let u = context.url, !u.isEmpty { lines.append("URL: \(u)") }
+            if let paths = context.selectionPaths, !paths.isEmpty {
+                lines.append("Selected files:\n" + paths.prefix(20).joined(separator: "\n"))
+            }
+            if let sel = context.selectionText, !sel.isEmpty {
+                lines.append("Selected text:\n\(String(sel.prefix(4000)))")
+            }
+            if let body = context.bodyText, !body.isEmpty {
+                lines.append("Content of what they're viewing:\n\(String(body.prefix(8000)))")
+            }
+            contextBlock = "\nCurrent context (what the user is looking at right now):\n" + lines.joined(separator: "\n") + "\n"
+        }
 
+        let isoNow: String = {
+            let f = ISO8601DateFormatter(); f.timeZone = .current; f.formatOptions = [.withInternetDateTime]
+            return f.string(from: Date())
+        }()
+
+        let prompt = """
+        You are the engine for a macOS search/assistant launcher. Decide the user's INTENT and respond with structured output.
+
+        Current date: \(isoNow)
+
+        - If the text is a COMMAND to create/modify/send/open something (verbs: remind, add, create, save, \
+        note, draft, reply, message, schedule, append, open; KO: 메모/추가/저장/답장/보내/알림/열어), set \
+        "mode":"action" and fill "action": choose ONE best "kind", put concrete values in "params" \
+        (dates ISO-8601 in the user's local timezone; resolve relative dates like "tomorrow 3pm" against \
+        Current date). Write "preview" as a one-line human confirmation (e.g. "Remind: Call Alex — \
+        2026-06-09 15:00"). Set "destructive":true only for sendMessage/replyMail/runShortcut. Use the \
+        current-context block to resolve "this", "this page", "here" (e.g. save the current URL/title to a note).
+        - Otherwise set "mode":"search", leave "action" out, and rank the candidate items best-first in \
+        "ranked" using each item's "id" by MEANING (not keyword overlap); include only plausibly relevant ones.
+
+        Always give a concise one-sentence "answer". You only PROPOSE the action; a separate executor performs \
+        it after the user confirms. Do not use any tools.
+
+        params by kind: addReminder{title,due}; addCalendarEvent{title,start,end,location?,notes?}; \
+        createNote{title,body}; appendNote{title,body}; composeMail/replyMail{to,subject,body}; \
+        sendMessage{to,text}; openURL{url}; revealFile{path}; copyText{text}; runShortcut{name,input?}.
+        \(contextBlock)
         Query: \(query.raw)
 
         Candidates (JSON array): \(projStr)
@@ -74,7 +120,12 @@ public struct ClaudeCLIReasoner: Reasoner {
         let rankedHandles = (structured["ranked"] as? [String]) ?? []
         let answer = structured["answer"] as? String
         let orderedIDs = rankedHandles.compactMap { handleToID[$0] }
-        return ReasonResult(orderedIDs: orderedIDs, answer: answer)
+
+        var action: Action? = nil
+        if (structured["mode"] as? String) == "action", let actDict = structured["action"] as? [String: Any] {
+            action = Action.from(actDict)
+        }
+        return ReasonResult(orderedIDs: orderedIDs, answer: answer, action: action)
     }
 
     // MARK: helpers
@@ -167,7 +218,7 @@ public struct SearchEngine: Sendable {
         }
 
         let capped = Array(stage1.candidates.prefix(stage2Cap))
-        guard let result = await reasoner.rank(query: q, candidates: capped) else {
+        guard let result = await reasoner.rank(query: q, candidates: capped, context: nil) else {
             // degrade to Stage-1
             return SearchResult(query: q, candidates: stage1.candidates,
                                 shouldEscalate: stage1.shouldEscalate, escalated: false, answer: nil)

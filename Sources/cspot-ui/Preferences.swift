@@ -34,7 +34,8 @@ enum Prefs {
     /// user opts into content search, which is slower.)
     static func liveSources() -> [CandidateSource] {
         var sources: [CandidateSource] = [
-            FileSource(includeContent: searchContent, dirs: searchDirs)
+            AppSource(),
+            FileSource(includeContent: searchContent, dirs: searchDirs),
         ]
         if includeCalendar { sources.append(CalendarSource()) }
         return sources

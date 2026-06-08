@@ -10,6 +10,29 @@ final class SearchViewModel: ObservableObject {
     @Published var elapsedMs = 0
     @Published var isAsking = false
     @Published var answer: String?
+    @Published var toast: String?
+    @Published var pendingAction: Action?   // a proposed mutating action awaiting ⏎ confirm
+    @Published var context: AppContext?   // the running app the user was in when they opened the launcher
+    @Published var axTrusted: Bool = AXReader.isTrusted
+    private var contextPID: pid_t?
+
+    private var current: Candidate? { results.indices.contains(selection) ? results[selection] : nil }
+
+    /// Capture the context of the app that was frontmost before the launcher took focus.
+    func captureContext(appName: String?, pid: pid_t?) {
+        contextPID = pid
+        Task { [weak self] in
+            let ctx = await ContextCapture.capture(appName: appName)
+            await MainActor.run { self?.context = ctx }
+        }
+    }
+
+    func refreshAXState() { axTrusted = AXReader.isTrusted }
+
+    func grantAccessibility() {
+        AXReader.promptForTrust()
+        AXReader.openAccessibilitySettings()
+    }
 
     private var task: Task<Void, Never>?
 
@@ -19,6 +42,8 @@ final class SearchViewModel: ObservableObject {
         selection = 0
         answer = nil
         isAsking = false
+        context = nil
+        pendingAction = nil
     }
 
     func onQueryChange() {
@@ -52,38 +77,107 @@ final class SearchViewModel: ObservableObject {
         selection = max(0, min(results.count - 1, selection + delta))
     }
 
-    /// Stage 2: ask the local Claude Code to re-rank the current candidates and synthesize an answer.
+    /// Stage 2: ask the local Claude Code to re-rank candidates / answer / or propose an action.
     func askClaude() {
         let q = query
-        guard !results.isEmpty, !isAsking, !q.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        guard !isAsking, !q.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         isAsking = true
         answer = nil
+        pendingAction = nil
         let snapshot = Array(results.prefix(40))
         let parsed = ParsedQuery.parse(q)
+        let lightCtx = context
         let reasoner = Prefs.reasoner()   // honor current model setting
         Task { [weak self] in
-            let r = await reasoner.rank(query: parsed, candidates: snapshot)
+            // Deep-read the captured app's content/selection now, targeting the app the user was in.
+            var ctx = await ContextCapture.capture(appName: lightCtx?.app, deep: true) ?? lightCtx
+            // Merge Accessibility-read selection/value when trusted (works across arbitrary apps).
+            if AXReader.isTrusted, let pid = await MainActor.run(body: { self?.contextPID }) ?? nil,
+               let ax = AXReader.snapshot(pid: pid) {
+                if let sel = ax.selectedText, !sel.isEmpty { ctx?.selectionText = sel }
+                if (ctx?.bodyText?.isEmpty ?? true), let val = ax.focusedValue { ctx?.bodyText = val }
+            }
+            let r = await reasoner.rank(query: parsed, candidates: snapshot, context: ctx)
+
+            // Command → action
+            if let action = r?.action {
+                if action.requiresConfirm {
+                    await MainActor.run {
+                        guard let self, self.query == q else { return }
+                        self.pendingAction = action          // show confirm band
+                        self.isAsking = false
+                    }
+                } else {
+                    let outcome = await ActionExecutor().perform(action, confirmed: false)  // open/draft/copy
+                    await MainActor.run {
+                        guard let self, self.query == q else { return }
+                        self.showToast(outcome.message)
+                        self.isAsking = false
+                    }
+                }
+                return
+            }
+
+            // Search → rerank + answer
             await MainActor.run {
-                guard let self, self.query == q else { return }   // ignore if the query moved on
+                guard let self, self.query == q else { return }
                 if let r {
                     self.results = SearchEngine.reorder(self.results, by: r.orderedIDs)
                     self.selection = 0
                     self.answer = r.answer ?? "Ranked by Claude."
                 } else {
-                    self.answer = "Claude ranking unavailable — showing local results."
+                    self.answer = "Claude unavailable — showing local results."
                 }
                 self.isAsking = false
             }
         }
     }
 
+    /// The ONLY place a mutating action runs (confirmed:true). Wired to ⏎ on the confirm band.
+    func confirmAction() {
+        guard let a = pendingAction else { return }
+        pendingAction = nil
+        isAsking = true
+        Task { [weak self] in
+            let outcome = await ActionExecutor().perform(a, confirmed: true)
+            await MainActor.run { self?.isAsking = false; self?.showToast(outcome.message) }
+        }
+    }
+
+    func cancelAction() {
+        guard pendingAction != nil else { return }
+        pendingAction = nil
+        showToast("Cancelled")
+    }
+
     func openSelected() {
-        guard results.indices.contains(selection) else { return }
-        let c = results[selection]
+        guard let c = current else { return }
         if let p = c.path {
             NSWorkspace.shared.open(URL(fileURLWithPath: p))
         } else if let u = c.uri, let url = URL(string: u) {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// ⌘R — reveal the selected file/app in Finder.
+    func revealSelected() {
+        guard let c = current, let p = c.path else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)])
+    }
+
+    /// ⌘C — copy the selected item's path (or uri/title) to the clipboard.
+    func copySelected() {
+        guard let c = current else { return }
+        let value = c.path ?? c.uri ?? c.title
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+        showToast("Copied \(c.path != nil ? "path" : "value")")
+    }
+
+    private func showToast(_ message: String) {
+        toast = message
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) { [weak self] in
+            if self?.toast == message { self?.toast = nil }
         }
     }
 }
@@ -94,6 +188,33 @@ struct CommandView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Accessibility grant nudge (lets us read selected text / field value in any app)
+            if !vm.axTrusted {
+                HStack(spacing: 6) {
+                    Image(systemName: "lock.shield").font(.system(size: 11)).foregroundStyle(.orange)
+                    Text("Grant Accessibility to read selected text in any app")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Button("Grant…") { vm.grantAccessibility() }
+                        .controlSize(.small).buttonStyle(.borderless)
+                }
+                .padding(.horizontal, 18).padding(.top, 8)
+            }
+
+            // current running-app context chip
+            if let ctx = vm.context {
+                HStack(spacing: 6) {
+                    Image(systemName: ctx.url != nil ? "globe" : "macwindow")
+                        .font(.system(size: 11)).foregroundStyle(Color.accentColor)
+                    Text(ctx.urlTitle ?? ctx.windowTitle ?? ctx.app)
+                        .lineLimit(1).foregroundStyle(.primary)
+                    Text("· \(ctx.app)").foregroundStyle(.secondary).lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .font(.system(size: 11))
+                .padding(.horizontal, 18).padding(.top, 10).padding(.bottom, 2)
+            }
+
             // search field
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass")
@@ -116,21 +237,40 @@ struct CommandView: View {
             .padding(.horizontal, 18)
             .padding(.vertical, 16)
 
-            // Stage-2 status / synthesized answer
-            if vm.isAsking || vm.answer != nil {
+            // Action confirm band (mutating action proposed by Stage 2)
+            if let action = vm.pendingAction {
+                Divider().opacity(0.5)
+                HStack(spacing: 10) {
+                    Image(systemName: actionIcon(action.kind))
+                        .font(.system(size: 16))
+                        .foregroundStyle(action.destructive ? .red : Color.accentColor)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(action.preview).font(.system(size: 13, weight: .medium)).lineLimit(2)
+                        Text("⏎ confirm · esc cancel")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 18).padding(.vertical, 12)
+                .background((action.destructive ? Color.red : Color.accentColor).opacity(0.08))
+            }
+
+            // Toast (copy feedback) / Stage-2 status / synthesized answer
+            if vm.pendingAction == nil, vm.toast != nil || vm.isAsking || vm.answer != nil {
                 Divider().opacity(0.5)
                 HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Color.accentColor)
-                    if vm.isAsking {
-                        Text("Asking Claude…")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
+                    if let toast = vm.toast {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 12)).foregroundStyle(.green)
+                        Text(toast).font(.system(size: 12)).foregroundStyle(.primary)
+                    } else if vm.isAsking {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 12)).foregroundStyle(Color.accentColor)
+                        Text("Asking Claude…").font(.system(size: 12)).foregroundStyle(.secondary)
                     } else if let answer = vm.answer {
-                        Text(answer)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.primary)
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 12)).foregroundStyle(Color.accentColor)
+                        Text(answer).font(.system(size: 12)).foregroundStyle(.primary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer(minLength: 0)
@@ -163,7 +303,7 @@ struct CommandView: View {
                 HStack {
                     Text("\(vm.results.count) results")
                     Spacer()
-                    Text("\(vm.elapsedMs) ms · ↑↓ navigate · ↩ open · ⌘↩ ask Claude · esc close")
+                    Text("\(vm.elapsedMs) ms · ↑↓ · ↩ open · ⌘R reveal · ⌘C copy · ⌘↩ ask · esc")
                 }
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
@@ -178,6 +318,20 @@ struct CommandView: View {
                 .strokeBorder(.white.opacity(0.12), lineWidth: 1)
         )
         .onAppear { focused = true }
+    }
+}
+
+func actionIcon(_ kind: ActionKind) -> String {
+    switch kind {
+    case .createNote, .appendNote: return "note.text"
+    case .addCalendarEvent: return "calendar.badge.plus"
+    case .addReminder: return "checklist"
+    case .composeMail, .replyMail: return "envelope"
+    case .sendMessage: return "message"
+    case .openURL: return "safari"
+    case .revealFile: return "folder"
+    case .copyText: return "doc.on.doc"
+    case .runShortcut: return "bolt"
     }
 }
 
@@ -219,6 +373,7 @@ struct ResultRow: View {
     private var icon: String {
         switch candidate.source {
         case .file: return "doc"
+        case .app: return "app"
         case .calendar: return "calendar"
         case .contact: return "person.crop.circle"
         default: return "sparkle"

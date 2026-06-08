@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import CSpotKit
 
 /// Borderless floating panel that can become key (so the text field accepts input) while disturbing
 /// the previously-active app as little as possible — the Spotlight behavior.
@@ -52,8 +53,9 @@ final class PanelController {
 
     /// Snapshot prep: render the panel with a query WITHOUT stealing key focus (so stray keystrokes
     /// can't land in the field) and without installing the nav key-monitor.
-    func snapshotPrepare(query: String) {
+    func snapshotPrepare(query: String, demoContext: AppContext? = nil) {
         viewModel.reset()
+        if let demoContext { viewModel.context = demoContext }
         viewModel.query = query
         positionTopThird()
         panel.orderFrontRegardless()   // visible + backed, but not the key window
@@ -72,7 +74,11 @@ final class PanelController {
     }
 
     func show() {
+        // Capture the app the user was in BEFORE we steal focus, then read its context.
+        let prev = NSWorkspace.shared.frontmostApplication
         viewModel.reset()
+        viewModel.refreshAXState()
+        viewModel.captureContext(appName: prev?.localizedName, pid: prev?.processIdentifier)
         positionTopThird()
         installKeyMonitor()
         NSApp.activate(ignoringOtherApps: true)
@@ -98,16 +104,33 @@ final class PanelController {
         removeKeyMonitor()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
+
+            // A proposed action is awaiting confirmation — ⏎ confirms, esc cancels (takes precedence).
+            if self.viewModel.pendingAction != nil {
+                switch event.keyCode {
+                case 36, 76: self.viewModel.confirmAction(); return nil
+                case 53: self.viewModel.cancelAction(); return nil
+                default: break
+                }
+            }
+
+            // ⌘-shortcuts (only when ⌘ is held, so plain typing of o/r/c is unaffected).
+            if event.modifierFlags.contains(.command) {
+                switch event.keyCode {
+                case 36, 76: self.viewModel.askClaude(); return nil           // ⌘↩ → Stage 2
+                case 31: self.viewModel.openSelected(); self.hide(); return nil  // ⌘O → open
+                case 15: self.viewModel.revealSelected(); self.hide(); return nil // ⌘R → reveal in Finder
+                case 8:  self.viewModel.copySelected(); return nil            // ⌘C → copy path
+                default: break
+                }
+            }
+
             switch event.keyCode {
             case 125: self.viewModel.moveSelection(1); return nil    // ↓
             case 126: self.viewModel.moveSelection(-1); return nil   // ↑
-            case 36, 76:                                             // ⏎ / enter
-                if event.modifierFlags.contains(.command) {
-                    self.viewModel.askClaude()                       // ⌘↩ → Stage 2 (keep panel open)
-                } else {
-                    self.viewModel.openSelected()                   // ↩ → open selected
-                    self.hide()
-                }
+            case 36, 76:                                             // ⏎ → open selected
+                self.viewModel.openSelected()
+                self.hide()
                 return nil
             case 53:                                                 // esc
                 self.hide()

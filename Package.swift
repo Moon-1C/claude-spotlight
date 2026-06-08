@@ -16,5 +16,12 @@ let package = Package(
             dependencies: ["CSpotKit"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        // Raycast-style GUI (runs unbundled via SwiftPM — no full Xcode needed):
+        // menu bar + ⌥Space global hotkey + floating SwiftUI search panel.
+        .executableTarget(
+            name: "cspot-ui",
+            dependencies: ["CSpotKit"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

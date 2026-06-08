@@ -4,7 +4,15 @@ import Foundation
 /// self-describing (path + modification date + content type + display name in one process call).
 public struct FileSource: CandidateSource {
     public let name = "file"
-    public init() {}
+    /// When false, skips the broad/slow `kMDItemTextContent` flavor — used by the live UI for snappy
+    /// name-only search; the CLI keeps it true for completeness.
+    public let includeContent: Bool
+    public let dirs: [String]
+
+    public init(includeContent: Bool = true, dirs: [String]? = nil) {
+        self.includeContent = includeContent
+        if let dirs, !dirs.isEmpty { self.dirs = dirs } else { self.dirs = Self.tierADirs() }
+    }
 
     /// Paths whose presence anywhere means the result is noise — applied even at Tier A.
     /// (Verified on this Mac: scoped mdfind still returns venv/site-packages/caches junk.)
@@ -25,7 +33,7 @@ public struct FileSource: CandidateSource {
     static let attrKeys = ["kMDItemContentModificationDate", "kMDItemContentType", "kMDItemDisplayName"]
 
     /// High-signal directories (Tier A). Tier B (home-wide) is deferred per the roadmap.
-    static func tierADirs() -> [String] {
+    public static func tierADirs() -> [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let names = ["Desktop", "Documents", "Downloads", "Pictures", "Movies"]
         return names.map { "\(home)/\($0)" }.filter { FileManager.default.fileExists(atPath: $0) }
@@ -33,20 +41,34 @@ public struct FileSource: CandidateSource {
 
     public func collect(_ q: ParsedQuery) async -> [Candidate] {
         var onlyin: [String] = []
-        for d in Self.tierADirs() { onlyin += ["-onlyin", d] }
+        for d in dirs { onlyin += ["-onlyin", d] }
         var attrs: [String] = []
         for k in Self.attrKeys { attrs += ["-attr", k] }
 
-        // Pick flavors: empty/recent query → recency; otherwise name-fuzzy + content.
-        // Per-flavor timeout: name/recency are cheap; content (kMDItemTextContent) is broad and slow,
-        // so it gets a longer leash. (The live app debounces, renders name hits first, and runs
-        // content as a progressive enhancement; the harness favors completeness over latency.)
+        // Search on content-bearing KEYWORDS (stopwords removed) so natural-language queries like
+        // "the report I worked on recently" still collect candidates instead of ANDing every filler word.
+        let terms = q.keywords
+
+        // Flavor selection:
+        //  - empty / recent: → recency only
+        //  - natural-language: breadth — OR over keywords (name + content) PLUS recent files, so Stage 2
+        //    has material to rank (NL queries are exactly the ones that escalate).
+        //  - lexical: precision — AND over keywords (name + content).
+        // Per-flavor timeout: name/recency cheap; content (kMDItemTextContent) is broad/slow → longer leash.
         var flavors: [(predicate: String, kind: MatchKind, timeoutMs: Int)] = []
-        if q.tokens.isEmpty || q.modifiers.contains(.recent) {
+        if terms.isEmpty || q.modifiers.contains(.recent) {
+            flavors.append((Self.recentPredicate(), .recent, 1500))
+        } else if q.isNaturalLanguage {
+            flavors.append((Self.namePredicate(terms, conjunction: " || "), .nameFuzzy, 1500))
+            if includeContent {
+                flavors.append((Self.contentPredicate(terms, conjunction: " || "), .content, 3000))
+            }
             flavors.append((Self.recentPredicate(), .recent, 1500))
         } else {
-            flavors.append((Self.namePredicate(q.tokens), .nameFuzzy, 1500))
-            flavors.append((Self.contentPredicate(q.tokens), .content, 3000))
+            flavors.append((Self.namePredicate(terms, conjunction: " && "), .nameFuzzy, 1500))
+            if includeContent {
+                flavors.append((Self.contentPredicate(terms, conjunction: " && "), .content, 3000))
+            }
         }
 
         return await withTaskGroup(of: [Candidate].self) { group in
@@ -73,12 +95,12 @@ public struct FileSource: CandidateSource {
         token.replacingOccurrences(of: "\"", with: "").replacingOccurrences(of: "\\", with: "")
     }
 
-    static func namePredicate(_ tokens: [String]) -> String {
-        tokens.map { "kMDItemDisplayName == \"*\(clean($0))*\"cd" }.joined(separator: " && ")
+    static func namePredicate(_ tokens: [String], conjunction: String = " && ") -> String {
+        tokens.map { "(kMDItemDisplayName == \"*\(clean($0))*\"cd)" }.joined(separator: conjunction)
     }
 
-    static func contentPredicate(_ tokens: [String]) -> String {
-        tokens.map { "kMDItemTextContent == \"*\(clean($0))*\"cd" }.joined(separator: " && ")
+    static func contentPredicate(_ tokens: [String], conjunction: String = " && ") -> String {
+        tokens.map { "(kMDItemTextContent == \"*\(clean($0))*\"cd)" }.joined(separator: conjunction)
     }
 
     static func recentPredicate() -> String {

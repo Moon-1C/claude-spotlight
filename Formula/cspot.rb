@@ -17,7 +17,7 @@
 # TODO (only for option B / tagged release): confirm `license`, fill url+sha256.
 
 class Cspot < Formula
-  desc "Spotlight-style natural-language local search — Stage-1 collector (files + calendar)"
+  desc "Natural-language Spotlight-style search over local files and calendar"
   homepage "https://github.com/Moon-1C/claude-spotlight"
   license "MIT"
 
@@ -27,8 +27,8 @@ class Cspot < Formula
   # url "https://github.com/Moon-1C/claude-spotlight/archive/refs/tags/v0.1.0.tar.gz"
   # sha256 "REPLACE_WITH_TARBALL_SHA256"
 
+  depends_on xcode: :build # Swift toolchain (Xcode Command Line Tools also work locally)
   depends_on :macos
-  depends_on xcode: :build   # provides the Swift toolchain (Command Line Tools also work locally)
 
   def install
     # --disable-sandbox: SwiftPM manages its own build cache; avoids Homebrew sandbox conflicts.
